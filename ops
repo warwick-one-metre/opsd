@@ -90,6 +90,16 @@ def dome_control(args):
     print('usage: {} dome (auto|manual)'.format(SCRIPT_NAME))
     return -1
 
+def tel_control(args):
+    """Changes the telescope between automatic and manual control"""
+    if len(args) > 0:
+        if args[0] == 'auto' or args[0] == 'manual':
+            with observatory.daemons.onemetre_operations.connect() as ops:
+                return ops.tel_control(args[0] == 'auto')
+
+    print('usage: {} tel (auto|manual)'.format(SCRIPT_NAME))
+    return -1
+
 def set_observing(args):
     """Enable or disable the global observing mode (opens the dome)"""
     if len(args) > 0:
@@ -175,6 +185,8 @@ if __name__ == '__main__':
         sys.exit(print_json())
     elif sys.argv[1] == 'dome':
         run_command(lambda: dome_control(sys.argv[2:]))
+    elif sys.argv[1] == 'tel':
+        run_command(lambda: tel_control(sys.argv[2:]))
     elif sys.argv[1] == 'observing':
         run_command(lambda: set_observing(sys.argv[2:]))
 

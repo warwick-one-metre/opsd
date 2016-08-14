@@ -25,6 +25,7 @@
 # pylint: disable=too-many-instance-attributes
 
 import datetime
+import math
 import threading
 import time
 import Pyro4
@@ -91,6 +92,84 @@ class DomeCommandStatus:
     HeartbeatCloseInProgress = 4
     EastShutterMustBeFullyOpen = 10
 
+TEL_STOW_POSITION = (0.616, 0.405)
+TEL_PARK_TIMEOUT = 60
+
+class StowTelescopeAction:
+    """Parks the telescope at the stow position and disables the power"""
+
+    def tick(self):
+        """Run a step of the logic of this action"""
+        # This is one of our simplist actions - it all runs within one tick
+
+        # Stop cameras
+        with observatory.daemons.onemetre_blue_camera.connect() as cam:
+            cam.stop_sequence()
+
+        with observatory.daemons.onemetre_red_camera.connect() as cam:
+            cam.stop_sequence()
+
+        # Query telescope state
+        with observatory.daemons.onemetre_telescope.connect() as tel:
+            t = tel.report_status()
+        with observatory.daemons.onemetre_power.connect() as power:
+            drive_enabled = power.last_measurement()['telescope_80v']
+
+        # Check if we are already parked
+        delta_alt = TEL_STOW_POSITION[0] - t['alt']
+        delta_az = TEL_STOW_POSITION[1] - t['az']
+        if math.sqrt(delta_alt**2 + delta_az**2) > 0.001:
+            if not drive_enabled:
+                with observatory.daemons.onemetre_power.connect() as power:
+                    if not power.switch('telescope_80v', True):
+                        raise Exception('failed to switch telescope drive power on')
+
+            with observatory.daemons.onemetre_telescope.connect(TEL_PARK_TIMEOUT) as tel:
+                slew = tel.slew_altaz(TEL_STOW_POSITION[0], TEL_STOW_POSITION[1])
+                if slew != 0:
+                    raise Exception('failed to park telescope with code ' + str(slew))
+
+        with observatory.daemons.onemetre_power.connect() as power:
+            if not power.switch('telescope_80v', False):
+                raise Exception('failed to switch telescope drive power off')
+
+    def notify_frame(self, headers):
+        """Called immediately when a new frame is available"""
+        # We're not interested in the cameras
+        pass
+
+    def action_name(self):
+        return 'STOWING'
+
+    def cancel(self):
+        """Attempt to cancel the current action"""
+        # Cannot be cancelled
+        return False
+
+class EveningFlatsTelescopeAction:
+    """Acquires flat frames in both arms while the sky intensity is in range"""
+    def __init__(self):
+        self._status = 'setup'
+
+    def tick(self):
+        """Runs a logic tick"""
+        if self._status == 'setup':
+            # configure cameras
+            # configure pipeline: intstats
+            # slew to zenith
+            # take initial bias
+            # open shutter
+            # take first test frame
+            pass
+
+    def notify_frame(self, headers):
+        # calculate new exposure time
+        # if in range enable saving
+        pass
+
+    def action_name(self):
+        return 'EVENINGFLAT'
+
 class TryLock(object):
     """Helper object for use with `with` statements"""
     def __init__(self, lock):
@@ -131,6 +210,18 @@ class OperationsDaemon:
         self._environment_lock = threading.Lock()
         self._environment_updated = datetime.datetime.utcnow()
         self._environment_safe = False
+
+        # "public" interface for changing telescope state
+        self._tel_requested_mode = OperationsMode.Manual
+
+        # internal telescope state - take the lock writing or reading coherant state!
+        self._tel_lock = threading.Lock()
+        self._tel_mode = OperationsMode.Manual
+        self._tel_updated = datetime.datetime.utcnow()
+
+        telloop = threading.Thread(target=self.__tel_loop)
+        telloop.daemon = True
+        telloop.start()
 
         runloop = threading.Thread(target=self.__ops_loop)
         runloop.daemon = True
@@ -243,6 +334,38 @@ class OperationsDaemon:
 
             time.sleep(LOOP_DELAY)
 
+    def __tel_mode(self, mode):
+        """Sets the telescope mode in a thread-safe manner"""
+        with self._tel_lock:
+            self._tel_mode = mode
+            self._tel_updated = datetime.datetime.utcnow()
+            return mode
+
+    def __tel_loop(self):
+        while True:
+            # Handle requests from the user to change between manual and automatic mode
+            # Manual intervention is required to clear errors and return to automatic mode.
+            auto_failure = self._tel_mode == OperationsMode.Error and \
+                self._tel_requested_mode == OperationsMode.Automatic
+
+            if self._tel_requested_mode != self._tel_mode and not auto_failure:
+                print('tel: changing mode from ' + OperationsMode.Names[self._tel_mode] + \
+                    ' to ' + OperationsMode.Names[self._tel_requested_mode])
+                self.__tel_mode(self._tel_requested_mode)
+
+            if self._tel_mode == OperationsMode.Automatic:
+                try:
+                    print('before tick')
+                    test = StowTelescopeAction()
+                    test.tick()
+                    print('after tick')
+                    self._tel_requested_mode = OperationsMode.Manual
+                except Exception as e:
+                    print('error: telescope controller: ', e)
+                    self._tel_mode(OperationsMode.Error)
+
+            time.sleep(LOOP_DELAY)
+
     def __environment_safe(self, safe):
         """Reports status back to the main thread in a thread-safe manner"""
         with self._environment_lock:
@@ -285,6 +408,14 @@ class OperationsDaemon:
             time.sleep(LOOP_DELAY)
 
     @Pyro4.expose
+    def notify_processed_frame(self, headers):
+        """Called by the pipeline daemon to notify that a new frame has completed processing
+           headers is a dictionary holding the key-value pairs from the fits header"""
+        print('Notified of a new frame:')
+        for key in headers:
+            print(key, headers[key])
+
+    @Pyro4.expose
     def dome_control(self, automatic):
         """Switch the dome between manual (observer) and automatic (opsd) control"""
         with TryLock(self._command_lock) as success:
@@ -299,7 +430,25 @@ class OperationsDaemon:
                 OperationsMode.Manual
 
             observatory.log.info('opsd', 'Dome control manually changed to '
-                                 + 'automatic' if automatic else 'manual')
+                                 + ('automatic' if automatic else 'manual'))
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def tel_control(self, automatic):
+        """Switch the telescope between manual (observer) and automatic (opsd) control"""
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if automatic and self._tel_mode == OperationsMode.Error:
+                return CommandStatus.InErrorState
+
+            self._tel_requested_mode = OperationsMode.Automatic if automatic else \
+                OperationsMode.Manual
+
+            observatory.log.info('opsd', 'Telescope control manually changed to '
+                                 + ('automatic' if automatic else 'manual'))
 
             return CommandStatus.Succeeded
 
