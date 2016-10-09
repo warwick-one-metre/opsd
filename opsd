@@ -95,19 +95,85 @@ class DomeCommandStatus:
 TEL_STOW_POSITION = (0.616, 0.405)
 TEL_PARK_TIMEOUT = 60
 
+class TelescopeIdleAction:
+    """Default action that waits until another activity has been queued"""
+
+    def __init__(self):
+        self._next_activity = None
+
+    def tick(self):
+        """Run a step of the logic of this action"""
+        if self._next_activity is not None:
+            return self._next_activity
+
+        return self    
+
+    def notify_frame(self, headers):
+        """Called immediately when a new frame is available"""
+        pass
+
+    def action_name(self):
+        """Returns the name of this action for the UI"""
+        return 'IDLE'
+
+    def cancel(self):
+        """Attempt to cancel the current action"""
+        pass
+
+class TelescopeErrorAction(TelescopeIdleAction):
+    """Represents a telescope error state.
+       Does nothing until explicitly cleared by the user"""
+
+    def tick(self):
+        """Run a step of the logic of this action"""
+        return self
+
+    def action_name(self):
+        return 'ERROR'
+
+class TelescopeDrivePowerAction(TelescopeIdleAction):
+    def __init__(self, enable):
+        self._enable = enable
+
+    def tick(self):
+        """Run a step of the logic of this action"""
+        with observatory.daemons.onemetre_power.connect() as power:
+            if not power.switch('telescope_80v', self._enable):
+                print('failed to switch telescope drive power to ' + str(enable))
+                return TelescopeErrorAction()
+
+        return self._next_activity
+
+class CameraStopAction(TelescopeIdleAction):
+    def __init__(self, camera):
+        self._camera = camera
+
+    def tick(self):
+        """Run a step of the logic of this action"""
+        if self._camera == 'blue':
+            daemon = observatory.daemons.onemetre_blue_camera
+        elif self._camera == 'red':
+            daemon = observatory.daemons.onemetre_red_camera
+        else:
+            print('invalid camera id ' + str(self._camera))
+            return TelescopeErrorAction()
+
+        with daemon.connect() as cam:
+            cam.stop_sequence()
+
+        return self._next_activity
+
 class StowTelescopeAction:
     """Parks the telescope at the stow position and disables the power"""
 
     def tick(self):
         """Run a step of the logic of this action"""
-        # This is one of our simplist actions - it all runs within one tick
-
-        # Stop cameras
-        with observatory.daemons.onemetre_blue_camera.connect() as cam:
-            cam.stop_sequence()
-
-        with observatory.daemons.onemetre_red_camera.connect() as cam:
-            cam.stop_sequence()
+        return sequence_activities([
+            CameraStopAction('blue'),
+            CameraStopAction('red'),
+            TelescopeDrivePowerAction(enable=True),
+            TelescopeSlewAction(TEL_STOW_POSITION),
+            TelescopeDrivePowerAction(enable=False)])
 
         # Query telescope state
         with observatory.daemons.onemetre_telescope.connect() as tel:
@@ -119,19 +185,10 @@ class StowTelescopeAction:
         delta_alt = TEL_STOW_POSITION[0] - t['alt']
         delta_az = TEL_STOW_POSITION[1] - t['az']
         if math.sqrt(delta_alt**2 + delta_az**2) > 0.001:
-            if not drive_enabled:
-                with observatory.daemons.onemetre_power.connect() as power:
-                    if not power.switch('telescope_80v', True):
-                        raise Exception('failed to switch telescope drive power on')
-
             with observatory.daemons.onemetre_telescope.connect(TEL_PARK_TIMEOUT) as tel:
                 slew = tel.slew_altaz(TEL_STOW_POSITION[0], TEL_STOW_POSITION[1])
                 if slew != 0:
                     raise Exception('failed to park telescope with code ' + str(slew))
-
-        with observatory.daemons.onemetre_power.connect() as power:
-            if not power.switch('telescope_80v', False):
-                raise Exception('failed to switch telescope drive power off')
 
     def notify_frame(self, headers):
         """Called immediately when a new frame is available"""
@@ -145,30 +202,6 @@ class StowTelescopeAction:
         """Attempt to cancel the current action"""
         # Cannot be cancelled
         return False
-
-class EveningFlatsTelescopeAction:
-    """Acquires flat frames in both arms while the sky intensity is in range"""
-    def __init__(self):
-        self._status = 'setup'
-
-    def tick(self):
-        """Runs a logic tick"""
-        if self._status == 'setup':
-            # configure cameras
-            # configure pipeline: intstats
-            # slew to zenith
-            # take initial bias
-            # open shutter
-            # take first test frame
-            pass
-
-    def notify_frame(self, headers):
-        # calculate new exposure time
-        # if in range enable saving
-        pass
-
-    def action_name(self):
-        return 'EVENINGFLAT'
 
 class TryLock(object):
     """Helper object for use with `with` statements"""
@@ -357,6 +390,8 @@ class OperationsDaemon:
                 try:
                     print('before tick')
                     test = StowTelescopeAction()
+                    
+                    test = run_actions(test)
                     test.tick()
                     print('after tick')
                     self._tel_requested_mode = OperationsMode.Manual
