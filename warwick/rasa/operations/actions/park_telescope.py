@@ -14,39 +14,28 @@
 # You should have received a copy of the GNU General Public License
 # along with opsd.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Telescope action to park the telescope and switch off the drive power"""
+"""Telescope action to park the telescope"""
 
-from warwick.observatory.common import daemons
 from warwick.observatory.operations import (
     TelescopeAction,
     TelescopeActionStatus)
-from warwick.rasa.telescope import CommandStatus as TelCommandStatus
-from .telescope_helpers import tel_park_stow
+from warwick.rasa.telescope import TelescopeState
+from .telescope_helpers import tel_park_stow, tel_status
 
 
-class Shutdown(TelescopeAction):
-    """Telescope action to park the telescope and switch off the drive power"""
+class ParkTelescope(TelescopeAction):
+    """Telescope action to park the telescope"""
     def __init__(self):
-        super().__init__('Shutdown', {})
+        super().__init__('Park Telescope', {})
 
     def run_thread(self):
         """Thread that runs the hardware actions"""
 
-        self.set_task('Parking Telescope')
-        if not tel_park_stow(self.log_name):
-            self.status = TelescopeActionStatus.Error
-            return
-
-        self.set_task('Shutting down')
-
-        with daemons.rasa_telescope.connect() as teld:
-            status = teld.shutdown()
-            if status not in [TelCommandStatus.Succeeded,
-                              TelCommandStatus.TelescopeNotEnabled]:
-                print('Failed to shutdown telescope')
+        status = tel_status(self.log_name)
+        if status and status.get('state', None) != TelescopeState.Disabled:
+            self.set_task('Slewing to Stow position')
+            if not tel_park_stow(self.log_name):
                 self.status = TelescopeActionStatus.Error
                 return
-
-        # TODO: Warm up camera, disable camera/focuser, turn off power
 
         self.status = TelescopeActionStatus.Complete
