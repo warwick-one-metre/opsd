@@ -5,7 +5,7 @@ License:        GPL3
 Summary:        W1m specific operations code
 Url:            https://github.com/warwick-one-metre/opsd
 BuildArch:      noarch
-Requires:	python3-warwick-observatory-operations, python3-warwick-observatory-dome, python3-astropy
+Requires:       python3-warwick-observatory-operations, python3-warwick-observatory-dome, python3-astropy, python3-scipy
 Requires:       python3-warwick-observatory-talon, python3-warwick-observatory-pipeline, python3-warwick-observatory-andor-camera
 
 %description
